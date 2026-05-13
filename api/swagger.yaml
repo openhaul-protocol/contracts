@@ -1,0 +1,351 @@
+openapi: 3.0.0
+info:
+  title: OpenHaul Protocol API
+  description: |
+    REST API for OpenHaul Protocol - Decentralized Logistics Marketplace on Polygon.
+    
+    This API provides read-only access to on-chain data and prepares transaction data 
+    for frontend signing. No private keys are stored server-side.
+  version: 1.0.0
+  contact:
+    name: OpenHaul Protocol
+    url: https://github.com/openhaul-protocol/contracts
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+  - url: https://api.openhaul.xyz/api/v1
+    description: Production (example)
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      tags:
+        - Health
+      responses:
+        200:
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /orders:
+    get:
+      summary: List all orders
+      tags:
+        - Orders
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [Created, Accepted, InTransit, Delivered, Confirmed, Disputed, Resolved, Cancelled, Completed]
+      responses:
+        200:
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderListResponse'
+
+    post:
+      summary: Create a new order (prepares tx data)
+      tags:
+        - Orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        200:
+          description: Transaction data prepared
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionResponse'
+
+  /orders/{orderId}:
+    get:
+      summary: Get order details
+      tags:
+        - Orders
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        200:
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+
+  /orders/shipper/{address}:
+    get:
+      summary: Get orders by shipper
+      tags:
+        - Orders
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{40}$'
+      responses:
+        200:
+          description: Shipper's orders
+
+  /orders/carrier/{address}:
+    get:
+      summary: Get orders by carrier
+      tags:
+        - Orders
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{40}$'
+      responses:
+        200:
+          description: Carrier's orders
+
+  /reputation/{address}:
+    get:
+      summary: Get reputation for address
+      tags:
+        - Reputation
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{40}$'
+      responses:
+        200:
+          description: Reputation details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReputationResponse'
+
+  /disputes/{disputeId}:
+    get:
+      summary: Get dispute details
+      tags:
+        - Disputes
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        200:
+          description: Dispute details
+
+  /tokens/haul/info:
+    get:
+      summary: HAUL token info
+      tags:
+        - Tokens
+      responses:
+        200:
+          description: Token information
+
+  /tokens/haul/balance/{address}:
+    get:
+      summary: HAUL balance
+      tags:
+        - Tokens
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Balance details
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+            blockchain:
+              type: object
+              properties:
+                connected:
+                  type: boolean
+                blockNumber:
+                  type: integer
+                chainId:
+                  type: integer
+
+    Order:
+      type: object
+      properties:
+        orderId:
+          type: integer
+        shipper:
+          type: string
+        carrier:
+          type: string
+        pickupLocation:
+          type: string
+        deliveryLocation:
+          type: string
+        cargoDetails:
+          type: string
+        cargoValue:
+          type: string
+        shippingFee:
+          type: string
+        collateral:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    OrderListResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+            limit:
+              type: integer
+            total:
+              type: integer
+            totalPages:
+              type: integer
+
+    OrderResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/Order'
+
+    CreateOrderRequest:
+      type: object
+      required:
+        - pickupLocation
+        - deliveryLocation
+        - cargoDetails
+        - cargoValue
+        - shippingFee
+        - shipperAddress
+      properties:
+        pickupLocation:
+          type: string
+          maxLength: 200
+        deliveryLocation:
+          type: string
+          maxLength: 200
+        cargoDetails:
+          type: string
+          maxLength: 500
+        cargoValue:
+          type: number
+        shippingFee:
+          type: number
+        shipperAddress:
+          type: string
+          pattern: '^0x[a-fA-F0-9]{40}$'
+
+    TransactionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            to:
+              type: string
+            from:
+              type: string
+            data:
+              type: string
+            value:
+              type: string
+            approvalNeeded:
+              type: boolean
+            approvalToken:
+              type: string
+            approvalSpender:
+              type: string
+            approvalAmount:
+              type: string
+
+    ReputationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            address:
+              type: string
+            score:
+              type: integer
+            tier:
+              type: string
+            completedOrders:
+              type: integer
+            totalRatings:
+              type: integer
+            positiveRatings:
+              type: integer
+            negativeRatings:
+              type: integer
+            disputesWon:
+              type: integer
+            disputesLost:
+              type: integer
+            registrationTime:
+              type: string
+              format: date-time
+            isRegistered:
+              type: boolean
