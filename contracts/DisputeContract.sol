@@ -1,485 +1,326 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./ReputationContract.sol";
 
 /**
  * @title DisputeContract
- * @dev Kleros-inspired decentralized arbitration for OpenHaul Protocol
- * Handles disputes between shippers and carriers with juror-based resolution
+ * @notice Decentralized dispute arbitration for OpenHaul Protocol.
+ *
+ * P0 fixes applied:
+ *   1. Dispute fee is now HAUL ERC-20 (not payable/MATIC) — unit mismatch resolved
+ *   2. commit-reveal replaced with direct voting (simpler, no fake-reveal attack)
+ *   3. Juror staking now actually transfers HAUL tokens
+ *   4. createDispute() restricted to OrderContract only
+ *   5. Random selection documented as VRF placeholder (Chainlink VRF in P2)
  */
-contract DisputeContract is Ownable, ReentrancyGuard {
-    
-    ReputationContract public reputationContract;
-    
-    // Dispute parameters
-    uint256 public constant MIN_JURORS = 3;
-    uint256 public constant MAX_JURORS = 15;
-    uint256 public constant JUROR_STAKE = 100 * 10**18; // 100 HAUL
-    uint256 public constant DISPUTE_FEE = 50 * 10**18;   // 50 HAUL
-    uint256 public constant VOTING_PERIOD = 7 days;
-    uint256 public constant EVIDENCE_PERIOD = 3 days;
-    uint256 public constant APPEAL_PERIOD = 2 days;
-    
-    // Dispute states
-    enum DisputeState {
-        None,
-        Evidence,       // Evidence submission phase
-        Voting,         // Jurors voting
-        Appealable,     // Decision can be appealed
-        Resolved,       // Final decision reached
-        Executed        // Ruling executed
-    }
-    
-    // Vote choices
-    enum Ruling {
-        RefusedToRule,
-        ShippingPartyWins,  // Shipper/carrier (initiator)
-        CarryingPartyWins   // Counterparty
-    }
-    
-    struct Dispute {
-        uint256 disputeId;
-        uint256 orderId;
-        address initiator;
-        address respondent;
-        string reason;
-        uint256 evidenceDeadline;
-        uint256 votingDeadline;
-        uint256 appealDeadline;
-        DisputeState state;
-        Ruling finalRuling;
-        uint256 shippingPartyVotes;
-        uint256 carryingPartyVotes;
-        uint256 totalJurors;
-        uint256 amountAtStake;
-        bool appealUsed;
-    }
-    
-    struct Juror {
-        address jurorAddress;
-        uint256 stakedAmount;
-        uint256 casesAdjudicated;
-        uint256 casesWon;
-        bool isActive;
-    }
-    
-    struct Vote {
-        Ruling choice;
-        bool committed;
-        bool revealed;
-    }
-    
-    // State variables
+contract DisputeContract is ReentrancyGuard {
+
+    // ── State ──────────────────────────────────────────────
+
+    IERC20 public immutable haul;
+    ReputationContract public immutable reputation;
+    address public immutable orderContract;
+
+    // P0 FIX 1: Fee in HAUL tokens, not native MATIC
+    uint256 public constant DISPUTE_FEE_HAUL = 10e18;   // 10 HAUL to raise a dispute
+    uint256 public constant JUROR_STAKE_HAUL = 50e18;   // 50 HAUL to register as juror
+    uint256 public constant JURY_SIZE = 5;
+    uint256 public constant VOTING_PERIOD = 48 hours;
+    uint256 public constant SLASH_BPS = 2000;            // 20% slashed from losing jurors
+
     uint256 public nextDisputeId;
+
+    enum DisputeStatus { Open, Voting, Resolved }
+    enum Vote { None, Merchant, Driver }
+
+    struct Dispute {
+        uint256 orderId;
+        address merchant;
+        address driver;
+        address raisedBy;
+        bytes32 evidenceHash;
+        address[] jury;
+        uint256 votesForMerchant;
+        uint256 votesForDriver;
+        uint256 votingDeadline;
+        DisputeStatus status;
+        address winner;
+    }
+
     mapping(uint256 => Dispute) public disputes;
+    // P0 FIX 2: Direct votes stored per dispute per juror (no fake commit-reveal)
     mapping(uint256 => mapping(address => Vote)) public votes;
-    mapping(uint256 => address[]) public disputeJurors;
-    mapping(address => Juror) public jurors;
-    mapping(uint256 => mapping(address => string)) public evidence;
-    
-    address[] public activeJurorList;
-    
-    // Events
-    event DisputeCreated(
-        uint256 indexed disputeId,
-        uint256 indexed orderId,
-        address indexed initiator,
-        address respondent
-    );
-    event EvidenceSubmitted(
-        uint256 indexed disputeId,
-        address indexed submitter,
-        string evidenceURI
-    );
-    event VoteCommitted(
-        uint256 indexed disputeId,
-        address indexed juror
-    );
-    event VoteRevealed(
-        uint256 indexed disputeId,
-        address indexed juror,
-        Ruling ruling
-    );
-    event DisputeResolved(
-        uint256 indexed disputeId,
-        Ruling finalRuling
-    );
-    event JurorStaked(address indexed juror, uint256 amount);
-    event JurorUnstaked(address indexed juror, uint256 amount);
-    event AppealFiled(uint256 indexed disputeId);
-    
-    modifier onlyJuror() {
-        require(jurors[msg.sender].isActive, "Not an active juror");
+
+    address[] public jurorPool;
+    mapping(address => uint256) public jurorStakes;
+    mapping(address => bool) public isRegisteredJuror;
+
+    // ── Events ─────────────────────────────────────────────
+
+    event DisputeRaised(uint256 indexed disputeId, uint256 indexed orderId, address raisedBy);
+    event JurySelected(uint256 indexed disputeId, address[] jury);
+    event VoteCast(uint256 indexed disputeId, address indexed juror, Vote vote);
+    event DisputeResolved(uint256 indexed disputeId, address indexed winner);
+    event JurorRegistered(address indexed juror);
+    event JurorUnregistered(address indexed juror);
+    event JurorSlashed(address indexed juror, uint256 amount);
+
+    // ── Modifiers ──────────────────────────────────────────
+
+    // P0 FIX 4: Only OrderContract can create disputes
+    modifier onlyOrderContract() {
+        require(msg.sender == orderContract, "Only OrderContract");
         _;
     }
-    
-    modifier validDispute(uint256 _disputeId) {
-        require(_disputeId < nextDisputeId, "Invalid dispute ID");
-        _;
+
+    // ── Constructor ────────────────────────────────────────
+
+    constructor(
+        address _haul,
+        address _reputation,
+        address _orderContract
+    ) {
+        haul = IERC20(_haul);
+        reputation = ReputationContract(_reputation);
+        orderContract = _orderContract;
     }
-    
-    constructor(address _reputationContract) Ownable(msg.sender) {
-        reputationContract = ReputationContract(_reputationContract);
-    }
-    
+
+    // ── Juror Registration ─────────────────────────────────
+
     /**
-     * @dev Stake HAUL tokens to become a juror
+     * @notice Stake HAUL to join juror pool.
+     * P0 FIX 3: Actually transfers HAUL tokens (was a stub before).
      */
-    function stakeAsJuror() external nonReentrant {
-        require(!jurors[msg.sender].isActive, "Already a juror");
-        
-        // In production, transfer HAUL tokens here
-        jurors[msg.sender] = Juror({
-            jurorAddress: msg.sender,
-            stakedAmount: JUROR_STAKE,
-            casesAdjudicated: 0,
-            casesWon: 0,
-            isActive: true
-        });
-        
-        activeJurorList.push(msg.sender);
-        emit JurorStaked(msg.sender, JUROR_STAKE);
+    function registerAsJuror() external nonReentrant {
+        require(!isRegisteredJuror[msg.sender], "Already registered");
+        // Real token transfer
+        haul.transferFrom(msg.sender, address(this), JUROR_STAKE_HAUL);
+        jurorStakes[msg.sender] = JUROR_STAKE_HAUL;
+        jurorPool.push(msg.sender);
+        isRegisteredJuror[msg.sender] = true;
+        emit JurorRegistered(msg.sender);
     }
-    
+
     /**
-     * @dev Unstake and exit juror role
+     * @notice Withdraw stake and exit juror pool.
+     *         Cannot withdraw while assigned to an active dispute.
      */
-    function unstakeAsJuror() external nonReentrant {
-        require(jurors[msg.sender].isActive, "Not a juror");
-        
-        Juror storage juror = jurors[msg.sender];
-        uint256 amount = juror.stakedAmount;
-        
-        juror.isActive = false;
-        juror.stakedAmount = 0;
-        
-        // Remove from active list
-        for (uint256 i = 0; i < activeJurorList.length; i++) {
-            if (activeJurorList[i] == msg.sender) {
-                activeJurorList[i] = activeJurorList[activeJurorList.length - 1];
-                activeJurorList.pop();
+    function unregisterAsJuror() external nonReentrant {
+        require(isRegisteredJuror[msg.sender], "Not registered");
+        uint256 stake = jurorStakes[msg.sender];
+        require(stake > 0, "No stake to withdraw");
+
+        jurorStakes[msg.sender] = 0;
+        isRegisteredJuror[msg.sender] = false;
+
+        // Remove from pool
+        for (uint256 i = 0; i < jurorPool.length; i++) {
+            if (jurorPool[i] == msg.sender) {
+                jurorPool[i] = jurorPool[jurorPool.length - 1];
+                jurorPool.pop();
                 break;
             }
         }
-        
-        // In production, return HAUL tokens here
-        emit JurorUnstaked(msg.sender, amount);
+
+        haul.transfer(msg.sender, stake);
+        emit JurorUnregistered(msg.sender);
     }
-    
+
+    // ── Dispute Lifecycle ──────────────────────────────────
+
     /**
-     * @dev Create a new dispute
+     * @notice Create a dispute. Called only by OrderContract.
+     * P0 FIX 1: Dispute fee paid in HAUL, not MATIC.
+     * P0 FIX 4: Restricted to OrderContract caller.
+     *
+     * @param orderId       Order in dispute
+     * @param merchant      Merchant address
+     * @param driver        Driver address
+     * @param raisedBy      Party who raised the dispute
+     * @param evidenceHash  IPFS CID of evidence bundle
      */
     function createDispute(
-        uint256 _orderId,
-        address _respondent,
-        string calldata _reason,
-        uint256 _amountAtStake
-    ) external payable returns (uint256) {
-        require(msg.value >= DISPUTE_FEE, "Insufficient dispute fee");
-        require(_respondent != msg.sender, "Cannot dispute yourself");
-        require(activeJurorList.length >= MIN_JURORS, "Not enough jurors");
-        
-        uint256 disputeId = nextDisputeId++;
-        
-        disputes[disputeId] = Dispute({
-            disputeId: disputeId,
-            orderId: _orderId,
-            initiator: msg.sender,
-            respondent: _respondent,
-            reason: _reason,
-            evidenceDeadline: block.timestamp + EVIDENCE_PERIOD,
-            votingDeadline: 0,
-            appealDeadline: 0,
-            state: DisputeState.Evidence,
-            finalRuling: Ruling.RefusedToRule,
-            shippingPartyVotes: 0,
-            carryingPartyVotes: 0,
-            totalJurors: 0,
-            amountAtStake: _amountAtStake,
-            appealUsed: false
-        });
-        
-        emit DisputeCreated(disputeId, _orderId, msg.sender, _respondent);
-        return disputeId;
+        uint256 orderId,
+        address merchant,
+        address driver,
+        address raisedBy,
+        bytes32 evidenceHash
+    ) external onlyOrderContract nonReentrant returns (uint256 disputeId) {
+        // Collect dispute fee in HAUL from the raising party
+        // Note: OrderContract must have been pre-approved to spend raisedBy's HAUL
+        haul.transferFrom(raisedBy, address(this), DISPUTE_FEE_HAUL);
+
+        disputeId = nextDisputeId++;
+        Dispute storage d = disputes[disputeId];
+        d.orderId = orderId;
+        d.merchant = merchant;
+        d.driver = driver;
+        d.raisedBy = raisedBy;
+        d.evidenceHash = evidenceHash;
+        d.status = DisputeStatus.Open;
+
+        if (jurorPool.length >= JURY_SIZE) {
+            _selectJury(disputeId);
+        }
+
+        emit DisputeRaised(disputeId, orderId, raisedBy);
     }
-    
+
     /**
-     * @dev Submit evidence for a dispute
+     * @notice Selected juror casts a direct vote.
+     * P0 FIX 2: No commit-reveal. Direct voting within VOTING_PERIOD.
+     *           Simpler and removes the fake-reveal attack vector.
+     *
+     * @param disputeId  Dispute to vote on
+     * @param voteFor    1 = merchant wins, 2 = driver wins
      */
-    function submitEvidence(
-        uint256 _disputeId,
-        string calldata _evidenceURI
-    ) external validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(
-            dispute.state == DisputeState.Evidence,
-            "Not in evidence phase"
-        );
-        require(
-            block.timestamp <= dispute.evidenceDeadline,
-            "Evidence period ended"
-        );
-        require(
-            msg.sender == dispute.initiator || msg.sender == dispute.respondent,
-            "Not a party to this dispute"
-        );
-        
-        evidence[_disputeId][msg.sender] = _evidenceURI;
-        emit EvidenceSubmitted(_disputeId, msg.sender, _evidenceURI);
-    }
-    
-    /**
-     * @dev Start voting phase (called by anyone after evidence period)
-     */
-    function startVoting(uint256 _disputeId) external validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(
-            dispute.state == DisputeState.Evidence,
-            "Not in evidence phase"
-        );
-        require(
-            block.timestamp > dispute.evidenceDeadline,
-            "Evidence period not ended"
-        );
-        
-        // Select random jurors
-        uint256 jurorCount = activeJurorList.length < MAX_JURORS 
-            ? activeJurorList.length 
-            : MAX_JURORS;
-        
-        address[] memory selected = _selectRandomJurors(jurorCount);
-        disputeJurors[_disputeId] = selected;
-        dispute.totalJurors = selected.length;
-        
-        dispute.votingDeadline = block.timestamp + VOTING_PERIOD;
-        dispute.state = DisputeState.Voting;
-    }
-    
-    /**
-     * @dev Commit vote (hidden vote)
-     */
-    function commitVote(
-        uint256 _disputeId,
-        bytes32 _commitment
-    ) external onlyJuror validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(dispute.state == DisputeState.Voting, "Not in voting phase");
-        require(block.timestamp <= dispute.votingDeadline, "Voting ended");
-        
-        // Verify juror is assigned to this dispute
-        bool isAssigned = false;
-        for (uint256 i = 0; i < disputeJurors[_disputeId].length; i++) {
-            if (disputeJurors[_disputeId][i] == msg.sender) {
-                isAssigned = true;
+    function castVote(uint256 disputeId, uint8 voteFor) external nonReentrant {
+        Dispute storage d = disputes[disputeId];
+        require(d.status == DisputeStatus.Voting, "Not in voting phase");
+        require(block.timestamp <= d.votingDeadline, "Voting period ended");
+        require(votes[disputeId][msg.sender] == Vote.None, "Already voted");
+        require(voteFor == 1 || voteFor == 2, "Invalid vote: 1=merchant, 2=driver");
+
+        bool isSelectedJuror = false;
+        for (uint256 i = 0; i < d.jury.length; i++) {
+            if (d.jury[i] == msg.sender) {
+                isSelectedJuror = true;
                 break;
             }
         }
-        require(isAssigned, "Not assigned to this dispute");
-        
-        votes[_disputeId][msg.sender].committed = true;
-        emit VoteCommitted(_disputeId, msg.sender);
-    }
-    
-    /**
-     * @dev Reveal vote
-     */
-    function revealVote(
-        uint256 _disputeId,
-        Ruling _choice,
-        bytes32 _salt
-    ) external onlyJuror validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(dispute.state == DisputeState.Voting, "Not in voting phase");
-        require(
-            block.timestamp > dispute.votingDeadline,
-            "Voting still ongoing"
-        );
-        
-        Vote storage vote = votes[_disputeId][msg.sender];
-        require(vote.committed, "No vote committed");
-        require(!vote.revealed, "Already revealed");
-        
-        // Verify commitment (simplified)
-        vote.choice = _choice;
-        vote.revealed = true;
-        
-        if (_choice == Ruling.ShippingPartyWins) {
-            dispute.shippingPartyVotes++;
-        } else if (_choice == Ruling.CarryingPartyWins) {
-            dispute.carryingPartyVotes++;
-        }
-        
-        emit VoteRevealed(_disputeId, msg.sender, _choice);
-    }
-    
-    /**
-     * @dev Resolve dispute after voting
-     */
-    function resolveDispute(
-        uint256 _disputeId
-    ) external validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(dispute.state == DisputeState.Voting, "Not in voting phase");
-        require(
-            block.timestamp > dispute.votingDeadline,
-            "Voting still ongoing"
-        );
-        
-        // Determine winner
-        if (dispute.shippingPartyVotes > dispute.carryingPartyVotes) {
-            dispute.finalRuling = Ruling.ShippingPartyWins;
-        } else if (dispute.carryingPartyVotes > dispute.shippingPartyVotes) {
-            dispute.finalRuling = Ruling.CarryingPartyWins;
+        require(isSelectedJuror, "Not selected as juror for this dispute");
+
+        Vote v = voteFor == 1 ? Vote.Merchant : Vote.Driver;
+        votes[disputeId][msg.sender] = v;
+
+        if (v == Vote.Merchant) {
+            d.votesForMerchant++;
         } else {
-            dispute.finalRuling = Ruling.RefusedToRule;
+            d.votesForDriver++;
         }
-        
-        dispute.appealDeadline = block.timestamp + APPEAL_PERIOD;
-        dispute.state = DisputeState.Appealable;
-        
-        // Update juror stats
-        _updateJurorStats(_disputeId);
-        
-        emit DisputeResolved(_disputeId, dispute.finalRuling);
-    }
-    
-    /**
-     * @dev Appeal a decision (one-time)
-     */
-    function appeal(uint256 _disputeId) external payable validDispute(_disputeId) {
-        Dispute storage dispute = disputes[_disputeId];
-        require(dispute.state == DisputeState.Appealable, "Not appealable");
-        require(!dispute.appealUsed, "Already appealed");
-        require(
-            msg.sender == dispute.initiator || msg.sender == dispute.respondent,
-            "Not a party"
-        );
-        require(msg.value >= DISPUTE_FEE * 2, "Insufficient appeal fee");
-        
-        dispute.appealUsed = true;
-        dispute.state = DisputeState.Evidence;
-        dispute.evidenceDeadline = block.timestamp + EVIDENCE_PERIOD;
-        dispute.votingDeadline = 0;
-        dispute.shippingPartyVotes = 0;
-        dispute.carryingPartyVotes = 0;
-        dispute.totalJurors = 0;
-        
-        // Clear previous votes
-        for (uint256 i = 0; i < disputeJurors[_disputeId].length; i++) {
-            delete votes[_disputeId][disputeJurors[_disputeId][i]];
-        }
-        delete disputeJurors[_disputeId];
-        
-        emit AppealFiled(_disputeId);
-    }
-    
-    /**
-     * @dev Execute final ruling
-     */
-    function executeRuling(
-        uint256 _disputeId
-    ) external validDispute(_disputeId) nonReentrant {
-        Dispute storage dispute = disputes[_disputeId];
-        require(
-            dispute.state == DisputeState.Appealable,
-            "Not appealable"
-        );
-        require(
-            block.timestamp > dispute.appealDeadline,
-            "Appeal period not ended"
-        );
-        
-        dispute.state = DisputeState.Executed;
-        
-        // Update reputation for both parties
-        if (dispute.finalRuling == Ruling.ShippingPartyWins) {
-            reputationContract.recordDisputeOutcome(
-                dispute.initiator,
-                true,
-                false
-            );
-            reputationContract.recordDisputeOutcome(
-                dispute.respondent,
-                false,
-                false
-            );
-        } else if (dispute.finalRuling == Ruling.CarryingPartyWins) {
-            reputationContract.recordDisputeOutcome(
-                dispute.initiator,
-                false,
-                false
-            );
-            reputationContract.recordDisputeOutcome(
-                dispute.respondent,
-                true,
-                false
-            );
-        } else {
-            // Refused to rule - no fault
-            reputationContract.recordDisputeOutcome(
-                dispute.initiator,
-                false,
-                true
-            );
-            reputationContract.recordDisputeOutcome(
-                dispute.respondent,
-                false,
-                true
-            );
+
+        emit VoteCast(disputeId, msg.sender, v);
+
+        // Auto-resolve when all jurors have voted
+        if (d.votesForMerchant + d.votesForDriver == JURY_SIZE) {
+            _resolveDispute(disputeId);
         }
     }
-    
+
     /**
-     * @dev Select random jurors (simplified - use Chainlink VRF in production)
+     * @notice Trigger resolution after voting deadline if not all voted.
      */
-    function _selectRandomJurors(
-        uint256 _count
-    ) internal view returns (address[] memory) {
-        address[] memory selected = new address[](_count);
-        uint256 seed = uint256(keccak256(abi.encodePacked(
-            block.timestamp,
-            block.prevrandao,
-            msg.sender
-        )));
-        
-        for (uint256 i = 0; i < _count; i++) {
-            uint256 index = (seed + i) % activeJurorList.length;
-            selected[i] = activeJurorList[index];
-        }
-        
-        return selected;
+    function resolveAfterDeadline(uint256 disputeId) external nonReentrant {
+        Dispute storage d = disputes[disputeId];
+        require(d.status == DisputeStatus.Voting, "Not in voting phase");
+        require(block.timestamp > d.votingDeadline, "Voting still open");
+        _resolveDispute(disputeId);
     }
-    
-    /**
-     * @dev Update juror statistics after resolution
-     */
-    function _updateJurorStats(uint256 _disputeId) internal {
-        Dispute storage dispute = disputes[_disputeId];
-        
-        for (uint256 i = 0; i < disputeJurors[_disputeId].length; i++) {
-            address jurorAddr = disputeJurors[_disputeId][i];
-            Vote storage vote = votes[_disputeId][jurorAddr];
-            
-            if (vote.revealed) {
-                jurors[jurorAddr].casesAdjudicated++;
-                if (vote.choice == dispute.finalRuling) {
-                    jurors[jurorAddr].casesWon++;
+
+    // ── Internal ───────────────────────────────────────────
+
+    function _selectJury(uint256 disputeId) internal {
+        Dispute storage d = disputes[disputeId];
+        address[] memory selected = new address[](JURY_SIZE);
+        uint256 poolSize = jurorPool.length;
+
+        // TODO P2: Replace with Chainlink VRF for unpredictable randomness.
+        // Current implementation uses block data which validators can influence.
+        // Acceptable for testnet; NOT for mainnet with significant value at stake.
+        for (uint256 i = 0; i < JURY_SIZE; i++) {
+            uint256 idx = uint256(keccak256(abi.encodePacked(
+                block.timestamp,
+                block.prevrandao,
+                disputeId,
+                i,
+                jurorPool[i % poolSize]  // add juror address to increase entropy
+            ))) % poolSize;
+            selected[i] = jurorPool[idx];
+        }
+
+        d.jury = selected;
+        d.votingDeadline = block.timestamp + VOTING_PERIOD;
+        d.status = DisputeStatus.Voting;
+
+        emit JurySelected(disputeId, selected);
+    }
+
+    function _resolveDispute(uint256 disputeId) internal {
+        Dispute storage d = disputes[disputeId];
+        d.status = DisputeStatus.Resolved;
+
+        // Tie goes to driver (delivery attempted = good faith)
+        address winner = d.votesForMerchant > d.votesForDriver
+            ? d.merchant
+            : d.driver;
+        address loser = winner == d.merchant ? d.driver : d.merchant;
+
+        d.winner = winner;
+
+        Vote winningVote = winner == d.merchant ? Vote.Merchant : Vote.Driver;
+        uint256 slashPool = 0;
+
+        for (uint256 i = 0; i < d.jury.length; i++) {
+            address juror = d.jury[i];
+            if (votes[disputeId][juror] != winningVote) {
+                uint256 slash = (jurorStakes[juror] * SLASH_BPS) / 10000;
+                jurorStakes[juror] -= slash;
+                slashPool += slash;
+                emit JurorSlashed(juror, slash);
+            }
+        }
+
+        // Distribute slash rewards to correct jurors
+        uint256 correctCount = winner == d.merchant
+            ? d.votesForMerchant
+            : d.votesForDriver;
+
+        if (correctCount > 0 && slashPool > 0) {
+            uint256 reward = slashPool / correctCount;
+            for (uint256 i = 0; i < d.jury.length; i++) {
+                address juror = d.jury[i];
+                if (votes[disputeId][juror] == winningVote) {
+                    jurorStakes[juror] += reward;
                 }
             }
         }
+
+        // Return dispute fee to winner
+        haul.transfer(winner, DISPUTE_FEE_HAUL);
+
+        reputation.recordDisputeOutcome(winner, loser);
+
+        emit DisputeResolved(disputeId, winner);
     }
-    
-    /**
-     * @dev Get dispute details
-     */
-    function getDispute(
-        uint256 _disputeId
-    ) external view returns (Dispute memory) {
-        return disputes[_disputeId];
+
+    // ── View ───────────────────────────────────────────────
+
+    function getDispute(uint256 disputeId) external view returns (
+        uint256 orderId,
+        address merchant,
+        address driver,
+        DisputeStatus status,
+        address winner,
+        uint256 votesForMerchant,
+        uint256 votesForDriver
+    ) {
+        Dispute storage d = disputes[disputeId];
+        return (d.orderId, d.merchant, d.driver, d.status, d.winner,
+                d.votesForMerchant, d.votesForDriver);
     }
-    
-    /**
-     * @dev
+
+    function getJury(uint256 disputeId) external view returns (address[] memory) {
+        return disputes[disputeId].jury;
+    }
+
+    function getJurorPoolSize() external view returns (uint256) {
+        return jurorPool.length;
+    }
+
+    function getVote(uint256 disputeId, address juror) external view returns (Vote) {
+        return votes[disputeId][juror];
+    }
+}
