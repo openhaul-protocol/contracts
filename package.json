@@ -1,0 +1,32 @@
+{
+  "name": "openhaul-protocol",
+  "version": "1.0.0",
+  "description": "OpenHaul Protocol - Decentralized logistics marketplace on Polygon",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:mumbai": "hardhat run scripts/deploy.js --network mumbai",
+    "deploy:polygon": "hardhat run scripts/deploy.js --network polygon",
+    "coverage": "hardhat coverage",
+    "node": "hardhat node"
+  },
+  "keywords": [
+    "blockchain",
+    "ethereum",
+    "polygon",
+    "logistics",
+    "defi",
+    "smart-contracts"
+  ],
+  "author": "OpenHaul Protocol Contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0",
+    "dotenv": "^16.3.0"
+  }
+}
