@@ -103,5 +103,6 @@ MIT License - see [LICENSE](LICENSE) file.
 
 ## Community
 
+- Telegram: [https://t.me/OpenHaulProtocol](https://t.me/OpenHaulProtocol)
 - Discord: [https://discord.gg/openhaul](https://discord.gg/openhaul)
 - Twitter: [@OpenHaulProtocol](https://twitter.com/OpenHaulProtocol)
