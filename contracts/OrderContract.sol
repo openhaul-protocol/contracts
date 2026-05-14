@@ -2,7 +2,8 @@
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./ReputationContract.sol";
 import "./DisputeContract.sol";
@@ -12,7 +13,7 @@ import "./DisputeContract.sol";
  * @dev Full order lifecycle management with USDT automatic settlement
  * for OpenHaul Protocol - decentralized logistics marketplace
  */
-contract OrderContract is Ownable, ReentrancyGuard {
+contract OrderContract is Ownable, Pausable, ReentrancyGuard {
     
     IERC20 public usdt;
     ReputationContract public reputationContract;
@@ -144,16 +145,16 @@ contract OrderContract is Ownable, ReentrancyGuard {
         string calldata _cargoDetails,
         uint256 _cargoValue,
         uint256 _shippingFee
-    ) external nonReentrant returns (uint256) {
+    ) external whenNotPaused nonReentrant returns (uint256) {
         require(_shippingFee > 0, "Shipping fee must be positive");
         require(_cargoValue > 0, "Cargo value must be positive");
         
         uint256 orderId = nextOrderId++;
         
-        // Transfer USDT from shipper (fee + collateral buffer)
-        uint256 totalRequired = _shippingFee + (_shippingFee * CARRIER_COLLATERAL_BPS / BPS_DENOMINATOR);
+        // Transfer USDT from shipper (shipping fee only)
+        // Collateral is paid by carrier in acceptOrder()
         require(
-            usdt.transferFrom(msg.sender, address(this), totalRequired),
+            usdt.transferFrom(msg.sender, address(this), _shippingFee),
             "USDT transfer failed"
         );
         
@@ -187,7 +188,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function acceptOrder(
         uint256 _orderId
-    ) external validOrder(_orderId) nonReentrant {
+    ) external validOrder(_orderId) whenNotPaused nonReentrant {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.Created, "Order not available");
         require(
@@ -225,7 +226,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function startTransit(
         uint256 _orderId
-    ) external validOrder(_orderId) onlyCarrier(_orderId) {
+    ) external validOrder(_orderId) onlyCarrier(_orderId) whenNotPaused {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.Accepted, "Order not accepted");
         
@@ -238,7 +239,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function markDelivered(
         uint256 _orderId
-    ) external validOrder(_orderId) onlyCarrier(_orderId) {
+    ) external validOrder(_orderId) onlyCarrier(_orderId) whenNotPaused {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.InTransit, "Order not in transit");
         require(
@@ -256,7 +257,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function confirmDelivery(
         uint256 _orderId
-    ) external validOrder(_orderId) onlyShipper(_orderId) {
+    ) external validOrder(_orderId) onlyShipper(_orderId) whenNotPaused {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.Delivered, "Order not delivered");
         require(
@@ -278,7 +279,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function autoConfirm(
         uint256 _orderId
-    ) external validOrder(_orderId) {
+    ) external validOrder(_orderId) whenNotPaused {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.Delivered, "Order not delivered");
         require(
@@ -323,8 +324,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
         order.status = OrderStatus.Completed;
         
         // Update reputation
-        reputationContract.recordCompletion(order.shipper);
-        reputationContract.recordCompletion(order.carrier);
+        reputationContract.recordCompletion(order.carrier, order.shipper, _orderId);
         
         emit OrderCompleted(_orderId, carrierPayout, platformFee);
         emit CarrierPayout(_orderId, carrierTotal);
@@ -335,14 +335,14 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function cancelOrder(
         uint256 _orderId
-    ) external validOrder(_orderId) onlyShipper(_orderId) nonReentrant {
+    ) external validOrder(_orderId) onlyShipper(_orderId) whenNotPaused nonReentrant {
         Order storage order = orders[_orderId];
         require(
             order.status == OrderStatus.Created,
             "Order cannot be cancelled"
         );
         
-        uint256 refund = order.shippingFee + (order.shippingFee * CARRIER_COLLATERAL_BPS / BPS_DENOMINATOR);
+        uint256 refund = order.shippingFee;
         
         order.status = OrderStatus.Cancelled;
         
@@ -358,7 +358,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
     function raiseDispute(
         uint256 _orderId,
         string calldata _reason
-    ) external validOrder(_orderId) nonReentrant {
+    ) external validOrder(_orderId) whenNotPaused nonReentrant {
         Order storage order = orders[_orderId];
         require(
             order.status == OrderStatus.Delivered ||
@@ -370,13 +370,12 @@ contract OrderContract is Ownable, ReentrancyGuard {
             "Not a party"
         );
         
-        address respondent = msg.sender == order.shipper ? order.carrier : order.shipper;
-        
-        uint256 disputeId = disputeContract.createDispute{value: 0}(
+        uint256 disputeId = disputeContract.createDispute(
             _orderId,
-            respondent,
-            _reason,
-            order.shippingFee + order.collateral
+            order.shipper,
+            order.carrier,
+            msg.sender,
+            keccak256(abi.encodePacked(_reason))
         );
         
         disputeIdByOrder[_orderId] = disputeId;
@@ -390,29 +389,29 @@ contract OrderContract is Ownable, ReentrancyGuard {
      */
     function executeDisputeRuling(
         uint256 _orderId
-    ) external validOrder(_orderId) nonReentrant {
+    ) external validOrder(_orderId) whenNotPaused nonReentrant {
         Order storage order = orders[_orderId];
         require(order.status == OrderStatus.Disputed, "Order not disputed");
         
         uint256 disputeId = disputeIdByOrder[_orderId];
-        DisputeContract.Dispute memory dispute = disputeContract.getDispute(disputeId);
+        (DisputeContract.DisputeStatus dStatus, address dWinner) = disputeContract.getDisputeStatusAndWinner(disputeId);
         require(
-            dispute.state == DisputeContract.DisputeState.Executed,
+            dStatus == DisputeContract.DisputeStatus.Resolved,
             "Dispute not resolved"
         );
         
         order.status = OrderStatus.Resolved;
         
-        if (dispute.finalRuling == DisputeContract.Ruling.ShippingPartyWins) {
+        if (dWinner == order.shipper) {
             // Shipper wins - refund shipping fee + collateral
             uint256 refund = order.shippingFee + order.collateral;
             require(usdt.transfer(order.shipper, refund), "Refund failed");
             emit ShipperRefund(_orderId, refund);
-        } else if (dispute.finalRuling == DisputeContract.Ruling.CarryingPartyWins) {
+        } else if (dWinner == order.carrier) {
             // Carrier wins - normal settlement
             _settleOrder(_orderId);
         } else {
-            // Refused to rule - split 50/50
+            // Refused to rule or tie - split 50/50
             uint256 split = (order.shippingFee + order.collateral) / 2;
             require(usdt.transfer(order.shipper, split), "Shipper split failed");
             require(usdt.transfer(order.carrier, split), "Carrier split failed");
@@ -425,7 +424,7 @@ contract OrderContract is Ownable, ReentrancyGuard {
     function rateCounterparty(
         uint256 _orderId,
         bool _isPositive
-    ) external validOrder(_orderId) {
+    ) external validOrder(_orderId) whenNotPaused {
         Order storage order = orders[_orderId];
         require(
             order.status == OrderStatus.Completed ||
@@ -433,11 +432,12 @@ contract OrderContract is Ownable, ReentrancyGuard {
             "Order not finished"
         );
         
+        uint8 rating = _isPositive ? uint8(5) : uint8(1);
         if (msg.sender == order.shipper && !order.shipperRated) {
-            reputationContract.submitRating(order.carrier, _isPositive, _orderId);
+            reputationContract.submitRating(_orderId, order.carrier, rating);
             order.shipperRated = true;
         } else if (msg.sender == order.carrier && !order.carrierRated) {
-            reputationContract.submitRating(order.shipper, _isPositive, _orderId);
+            reputationContract.submitRating(_orderId, order.shipper, rating);
             order.carrierRated = true;
         } else {
             revert("Not authorized or already rated");
@@ -485,5 +485,19 @@ contract OrderContract is Ownable, ReentrancyGuard {
         uint256 amount = totalPlatformFees;
         totalPlatformFees = 0;
         require(usdt.transfer(treasury, amount), "Withdraw failed");
+    }
+
+    /**
+     * @dev Pause the contract (emergency stop)
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
     }
 }

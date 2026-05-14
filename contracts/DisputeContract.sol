@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./ReputationContract.sol";
 
 /**
@@ -16,7 +18,7 @@ import "./ReputationContract.sol";
  *   4. createDispute() restricted to OrderContract only
  *   5. Random selection documented as VRF placeholder (Chainlink VRF in P2)
  */
-contract DisputeContract is ReentrancyGuard {
+contract DisputeContract is Ownable, Pausable, ReentrancyGuard {
 
     // ── State ──────────────────────────────────────────────
 
@@ -82,7 +84,7 @@ contract DisputeContract is ReentrancyGuard {
         address _haul,
         address _reputation,
         address _orderContract
-    ) {
+    ) Ownable(msg.sender) {
         haul = IERC20(_haul);
         reputation = ReputationContract(_reputation);
         orderContract = _orderContract;
@@ -94,7 +96,7 @@ contract DisputeContract is ReentrancyGuard {
      * @notice Stake HAUL to join juror pool.
      * P0 FIX 3: Actually transfers HAUL tokens (was a stub before).
      */
-    function registerAsJuror() external nonReentrant {
+    function registerAsJuror() external whenNotPaused nonReentrant {
         require(!isRegisteredJuror[msg.sender], "Already registered");
         // Real token transfer
         haul.transferFrom(msg.sender, address(this), JUROR_STAKE_HAUL);
@@ -108,7 +110,7 @@ contract DisputeContract is ReentrancyGuard {
      * @notice Withdraw stake and exit juror pool.
      *         Cannot withdraw while assigned to an active dispute.
      */
-    function unregisterAsJuror() external nonReentrant {
+    function unregisterAsJuror() external whenNotPaused nonReentrant {
         require(isRegisteredJuror[msg.sender], "Not registered");
         uint256 stake = jurorStakes[msg.sender];
         require(stake > 0, "No stake to withdraw");
@@ -148,7 +150,7 @@ contract DisputeContract is ReentrancyGuard {
         address driver,
         address raisedBy,
         bytes32 evidenceHash
-    ) external onlyOrderContract nonReentrant returns (uint256 disputeId) {
+    ) external onlyOrderContract whenNotPaused nonReentrant returns (uint256 disputeId) {
         // Collect dispute fee in HAUL from the raising party
         // Note: OrderContract must have been pre-approved to spend raisedBy's HAUL
         haul.transferFrom(raisedBy, address(this), DISPUTE_FEE_HAUL);
@@ -177,7 +179,7 @@ contract DisputeContract is ReentrancyGuard {
      * @param disputeId  Dispute to vote on
      * @param voteFor    1 = merchant wins, 2 = driver wins
      */
-    function castVote(uint256 disputeId, uint8 voteFor) external nonReentrant {
+    function castVote(uint256 disputeId, uint8 voteFor) external whenNotPaused nonReentrant {
         Dispute storage d = disputes[disputeId];
         require(d.status == DisputeStatus.Voting, "Not in voting phase");
         require(block.timestamp <= d.votingDeadline, "Voting period ended");
@@ -213,7 +215,7 @@ contract DisputeContract is ReentrancyGuard {
     /**
      * @notice Trigger resolution after voting deadline if not all voted.
      */
-    function resolveAfterDeadline(uint256 disputeId) external nonReentrant {
+    function resolveAfterDeadline(uint256 disputeId) external whenNotPaused nonReentrant {
         Dispute storage d = disputes[disputeId];
         require(d.status == DisputeStatus.Voting, "Not in voting phase");
         require(block.timestamp > d.votingDeadline, "Voting still open");
@@ -322,5 +324,30 @@ contract DisputeContract is ReentrancyGuard {
 
     function getVote(uint256 disputeId, address juror) external view returns (Vote) {
         return votes[disputeId][juror];
+    }
+
+    /**
+     * @notice Get only the status and winner of a dispute.
+     *         Used by OrderContract to avoid stack-too-deep.
+     */
+    function getDisputeStatusAndWinner(uint256 disputeId) external view returns (DisputeStatus, address) {
+        Dispute storage d = disputes[disputeId];
+        return (d.status, d.winner);
+    }
+
+    // ── Emergency Pause ────────────────────────────────────
+
+    /**
+     * @notice Pause the contract (emergency stop)
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
     }
 }

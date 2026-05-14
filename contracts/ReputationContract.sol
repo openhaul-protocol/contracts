@@ -184,6 +184,16 @@ contract ReputationContract {
         return finalScore > 100 ? 100 : finalScore;
     }
 
+    /**
+     * @notice Check if a participant meets the minimum reputation threshold.
+     * @param participant Address to check
+     * @param threshold Minimum composite score required (0-100)
+     * @return true if score >= threshold
+     */
+    function meetsThreshold(address participant, uint256 threshold) external view returns (bool) {
+        return this.getCompositeScore(participant) >= threshold;
+    }
+
     function getAverageRating(address participant) external view returns (uint256) {
         Score memory s = scores[participant];
         if (s.ratingCount == 0) return 0;
